@@ -1,0 +1,111 @@
+name: Desktop release
+
+# Triggered by tags like `desktop-v0.6.51`. Builds the HyperFrames desktop app
+# (Tauri) for Windows / macOS / Linux, then publishes a GitHub Release with
+# the per-platform installers and a signed `latest.json` for the auto-updater.
+#
+# Required repository secrets — see packages/desktop/README.md "Signing &
+# release" for setup steps. The workflow degrades gracefully when secrets are
+# absent so unsigned builds still succeed for testing:
+#
+#   TAURI_SIGNING_PRIVATE_KEY        # generated with `bunx tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   WINDOWS_CERTIFICATE              # base64 .pfx (Authenticode)
+#   WINDOWS_CERTIFICATE_PASSWORD
+#   APPLE_CERTIFICATE                # base64 .p12 (Developer ID Application)
+#   APPLE_CERTIFICATE_PASSWORD
+#   APPLE_SIGNING_IDENTITY           # e.g. "Developer ID Application: HyperFrames (TEAMID)"
+#   APPLE_ID                         # Apple ID email for notarization
+#   APPLE_PASSWORD                   # app-specific password
+#   APPLE_TEAM_ID
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: macos-14
+            target: aarch64-apple-darwin
+          - platform: macos-13
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            unzip
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: packages/desktop/src-tauri
+
+      - name: Install workspace deps
+        run: bun install
+
+      - name: Build monorepo (core + studio + cli)
+        run: bun run build
+
+      - name: Prepare desktop artifacts (CLI + Studio + Chromium + ffmpeg)
+        working-directory: packages/desktop
+        run: bun run prepare:all
+
+      # Tauri Action wraps signing-secret plumbing for all 3 OSes and publishes
+      # release artifacts. It also generates `latest.json` for the updater
+      # when `TAURI_SIGNING_PRIVATE_KEY` is set.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Windows code signing
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # macOS code signing + notarization
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: packages/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "HyperFrames ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}

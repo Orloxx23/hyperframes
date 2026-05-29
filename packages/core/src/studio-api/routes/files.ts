@@ -10,8 +10,12 @@ import {
   statSync,
   renameSync,
   readdirSync,
+  copyFileSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "node:fs";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, basename } from "node:path";
 import type { StudioApiAdapter } from "../types.js";
 import { isAudioFile } from "../helpers/mime.js";
 import { generateWaveformCache } from "../helpers/waveform.js";
@@ -458,4 +462,123 @@ export function registerFileRoutes(api: Hono, adapter: StudioApiAdapter): void {
       return c.json({ ok: true, files: uploaded, skipped, invalid }, 201);
     },
   );
+
+  // ── Local copy (no multipart) ───────────────────────────────────────────
+  //
+  // Import media from absolute paths on the host machine into the project
+  // directory. Intended for environments where the client already knows the
+  // source path (Electron / Tauri / drag-drop with `webkitGetAsEntry()` plus
+  // a native bridge) and bouncing the bytes through a multipart POST would
+  // just double-read them.
+  //
+  // Body:
+  //   { sources: string[], dir?: string }
+  //
+  // Behaviour mirrors the multipart upload route: dedup names with " (2)",
+  // run the media-validation magic-number sniff, drop the waveform cache
+  // for audio, return `{ ok, files, skipped, invalid }`.
+  api.post("/projects/:id/copy-file", async (c) => {
+    const project = await adapter.resolveProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+
+    const body = (await c.req.json().catch(() => null)) as {
+      sources?: unknown;
+      dir?: unknown;
+    } | null;
+    const sources = Array.isArray(body?.sources)
+      ? body.sources.filter((s): s is string => typeof s === "string")
+      : [];
+    if (sources.length === 0) return c.json({ error: "sources is required" }, 400);
+
+    const subDir = typeof body?.dir === "string" ? body.dir : "";
+    const targetDir = subDir ? resolve(project.dir, subDir) : project.dir;
+    if (!isSafePath(project.dir, targetDir)) return c.json({ error: "forbidden" }, 403);
+    if (subDir && !existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+
+    const copied: string[] = [];
+    const skipped: string[] = [];
+    const invalid: Array<{ name: string; reason: string }> = [];
+
+    for (const sourcePath of sources) {
+      // Reject obviously hostile inputs early. We accept arbitrary absolute
+      // paths on the host because the caller is already trusted (same-origin
+      // localhost or native shell); we just guard against trivial mistakes.
+      if (sourcePath.includes("\0")) continue;
+      let sourceStat;
+      try {
+        sourceStat = statSync(sourcePath);
+      } catch {
+        skipped.push(basename(sourcePath));
+        continue;
+      }
+      if (!sourceStat.isFile()) {
+        skipped.push(basename(sourcePath));
+        continue;
+      }
+      const name = basename(sourcePath);
+      if (!name || name.includes("..")) continue;
+
+      const destPath = resolve(targetDir, name);
+      if (!isSafePath(project.dir, destPath)) continue;
+
+      // Dedup name on collision (same logic as multipart upload).
+      let finalPath = destPath;
+      let finalName = name;
+      if (existsSync(finalPath)) {
+        const dotIdx = name.indexOf(".", name.startsWith(".") ? 1 : 0);
+        const ext = dotIdx > 0 ? name.slice(dotIdx) : "";
+        const base = dotIdx > 0 ? name.slice(0, dotIdx) : name;
+        let n = 2;
+        while (n < 10000 && existsSync(resolve(targetDir, `${base} (${n})${ext}`))) n++;
+        if (n >= 10000) {
+          skipped.push(name);
+          continue;
+        }
+        finalName = `${base} (${n})${ext}`;
+        finalPath = resolve(targetDir, finalName);
+      }
+
+      // Read a prefix to validate magic numbers. We don't load the whole
+      // buffer (could be GB) — validateUploadedMediaBuffer only inspects
+      // the first few hundred bytes anyway.
+      try {
+        const probeSize = Math.min(8192, sourceStat.size);
+        const probe = Buffer.alloc(probeSize);
+        const fd = openSync(sourcePath, "r");
+        try {
+          readSync(fd, probe, 0, probeSize, 0);
+        } finally {
+          closeSync(fd);
+        }
+        const validation = validateUploadedMediaBuffer(finalName, probe);
+        if (!validation.ok) {
+          invalid.push({ name: finalName, reason: validation.reason });
+          continue;
+        }
+      } catch (err) {
+        invalid.push({
+          name: finalName,
+          reason: err instanceof Error ? err.message : "read failed",
+        });
+        continue;
+      }
+
+      try {
+        copyFileSync(sourcePath, finalPath);
+      } catch (err) {
+        invalid.push({
+          name: finalName,
+          reason: err instanceof Error ? err.message : "copy failed",
+        });
+        continue;
+      }
+      const relativePath = subDir ? join(subDir, finalName) : finalName;
+      copied.push(relativePath);
+      if (isAudioFile(finalName)) {
+        generateWaveformCache(project.dir, relativePath).catch(() => {});
+      }
+    }
+
+    return c.json({ ok: true, files: copied, skipped, invalid }, 201);
+  });
 }

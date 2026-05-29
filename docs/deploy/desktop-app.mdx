@@ -1,0 +1,181 @@
+---
+title: Desktop app
+description: "HyperFrames Studio se distribuye como app de escritorio (Tauri v2) desde el paquete @hyperframes/desktop. Todo offline, sin cloud."
+---
+
+El monorepo incluye `@hyperframes/desktop`, un shell de Tauri v2 que empaqueta el Studio como app de escritorio nativa. El CLI corre como **sidecar** (binario único compilado con `bun --compile`), la webview apunta al `hyperframes preview` HTTP local, y Chromium + ffmpeg viajan como **resources** del bundle. Todo offline, sin servicios externos.
+
+## Tres flujos
+
+### Desarrollar la app
+
+```bash
+# Una sola vez tras clonar el monorepo:
+bun install
+bun run build              # core + studio + cli
+bun run desktop:prepare    # compila el CLI sidecar y copia el Studio bundle
+
+# Para abrir la app:
+bun run desktop:dev
+```
+
+La primera build de Rust toma ~3 minutos. Las siguientes son incrementales.
+
+`desktop:dev` abre una ventana apuntada al Studio servido por el sidecar en `http://127.0.0.1:177XX`. El workspace inicial se crea en `<Documents>/HyperFrames` — si no existe, el splash del Studio renderiza el picker de proyectos.
+
+Re-corre `desktop:prepare` cuando cambies código del CLI (`packages/cli`) o del Studio (`packages/studio`). Cambios sólo al shell Rust (`packages/desktop/src-tauri/src`) no lo requieren.
+
+### Generar un installer local (sin firmar)
+
+```bash
+# Si no lo corriste ya (la primera vez baja Chrome ~160MB, ffmpeg ~50MB y
+# el binario claude CLI del Agent SDK ~225MB):
+bun run desktop:prepare
+
+# Build:
+bun run desktop:build
+```
+
+Output (Windows):
+
+```
+packages/desktop/src-tauri/target/release/bundle/msi/HyperFrames_*.msi
+packages/desktop/src-tauri/target/release/bundle/nsis/HyperFrames_*-setup.exe
+```
+
+El installer es ~500 MB e incluye todo lo necesario para correr offline desde la primera instalación: CLI compilado, Studio, Chromium, ffmpeg y el binario que la Agent SDK spawnea para el chat. Sin certs, Windows muestra warnings de SmartScreen pero el .msi instala bien.
+
+### Releasear firmado
+
+```bash
+git tag desktop-v0.6.51
+git push origin desktop-v0.6.51
+```
+
+El workflow `.github/workflows/desktop-release.yml` builds para Windows / macOS (Intel + ARM) / Linux en paralelo, firma con los secrets del repo, y crea un GitHub Release en draft con los installers + `latest.json` para el auto-updater.
+
+## Arquitectura del paquete
+
+```
+packages/desktop/
+├── src-tauri/                  # Rust crate (Tauri v2)
+│   ├── src/
+│   │   ├── lib.rs              # boot: spawn sidecar → wait ready → show window
+│   │   ├── sidecar.rs          # spawn + env vars + supervisión
+│   │   ├── port.rs             # selección de puerto 17777..17877 + readiness probe
+│   │   └── paths.rs            # resolución de resources bundleados
+│   ├── binaries/               # CLI compilado (gitignored)
+│   ├── resources/              # Studio + Chromium + ffmpeg (gitignored)
+│   ├── capabilities/default.json
+│   └── tauri.conf.json
+├── scripts/                    # produce binaries/ y resources/
+│   ├── prepare-binaries.ts     # bun --compile del CLI
+│   ├── prepare-studio.ts       # copia packages/studio/dist
+│   ├── prepare-chromium.ts     # baja chrome-headless-shell pinned
+│   ├── prepare-ffmpeg.ts       # baja ffmpeg estático por plataforma
+│   └── prepare-claude-cli.ts   # copia claude.exe del Agent SDK
+└── frontend-stub/              # HTML temporal, se reemplaza por la URL local al boot
+```
+
+## Flujo de arranque en runtime
+
+1. Tauri toma un puerto libre del rango `17777..17877` (selección serial, evita races).
+2. Spawnea el sidecar:
+   ```
+   hyperframes preview <workspace_dir> --port <port> --no-open
+   ```
+   con env vars:
+   - `HYPERFRAMES_STUDIO_DIR` → `resources/studio/`
+   - `HYPERFRAMES_RUNTIME_JS` → `resources/studio/hyperframe-runtime.js`
+   - `PRODUCER_HEADLESS_SHELL_PATH` → `resources/chrome/chrome-headless-shell[.exe]`
+   - `PATH` (prepended) → `resources/ffmpeg/`
+   - `HYPERFRAMES_CLAUDE_CLI_PATH` → `resources/claude/claude[.exe]` (binario que la Agent SDK spawnea para el chat in-Studio)
+   - `HYPERFRAMES_TELEMETRY` → `""` (off por default)
+3. Hace polling HTTP a `/__hyperframes_config` hasta que el sidecar responde `{ "isHyperframes": true }` (timeout 45s).
+4. Navega la ventana principal a `http://127.0.0.1:<port>` y la muestra.
+5. Al cerrar la ventana: Tauri kill el child via `RunEvent::ExitRequested` → `SidecarHandle::kill`.
+
+El endpoint `/__hyperframes_config` ya existía en [packages/core/src/studio-api](https://github.com/heygen-com/hyperframes/blob/main/packages/cli/src/server/studioServer.ts) para detectar instancias huérfanas en CLI; el desktop lo reutiliza como readiness probe.
+
+## Decisiones técnicas
+
+### `sharp` y `onnxruntime-node` se externalizan en el compile
+
+`bun build --compile` no resuelve el require dinámico de sharp (`@img/sharp-${platform}-${arch}/sharp.node`) dentro de su virtual fs. Mismo problema con onnxruntime-node. Ambos `--external` en el script `prepare-binaries.ts`.
+
+Esto requirió hacer **lazy** el `import sharp` en [packages/cli/src/capture/contactSheet.ts](https://github.com/heygen-com/hyperframes/blob/main/packages/cli/src/capture/contactSheet.ts) — antes, hacer `hyperframes --version` en el binario compilado evaluaba el módulo top-level y crasheaba. El refactor también mejora cold-start en la CLI común.
+
+El desktop nunca invoca los codepaths que usan estos módulos (`snapshot`, `remove-background`), así que externalizar es seguro.
+
+### El Studio bundle viaja como Tauri resource, no embebido en el binario
+
+El SPA del Studio es HTML/CSS/JS estático que `studioServer.ts` lee del disco vía `fs.readFileSync`. Si lo embebiéramos como recurso de `bun --compile`, los paths quedarían virtualizados en `B:/~BUN/root/...` y el comportamiento de `existsSync` se vuelve impredecible.
+
+Solución: el Studio se copia a `src-tauri/resources/studio/` y `studioServer.ts:resolveStudioBundle` consulta primero la env var `HYPERFRAMES_STUDIO_DIR`. Es un cambio chico al CLI que no afecta los modos existentes (workspace/dev/local).
+
+### ffmpeg via PATH, no env var
+
+El engine spawnea ffmpeg con `spawn("ffmpeg", ...)` literal — no respeta ninguna env var. El sidecar prependa `resources/ffmpeg/` al PATH del child antes de spawnearlo. Cero cambios al engine.
+
+### El binario `claude` del Agent SDK también va como resource (~225MB)
+
+El chat in-Studio depende de `@anthropic-ai/claude-agent-sdk`, que spawnea un binario nativo `claude` distribuido como optional dep por plataforma (`@anthropic-ai/claude-agent-sdk-win32-x64`, etc.). Cuando el CLI viaja como binario único de `bun --compile`, esas optional deps tienen exactamente el mismo problema que sharp — no se resuelven en el virtual fs y el SDK lanza:
+
+```
+Error: Native CLI binary for win32-x64 not found.
+Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional,
+or set options.pathToClaudeCodeExecutable.
+```
+
+Solución (paralela a Chromium/ffmpeg): `prepare:claude-cli` copia el binario al `resources/claude/` del bundle Tauri, el sidecar setea `HYPERFRAMES_CLAUDE_CLI_PATH`, y `agentLoop.ts` lo pasa al SDK vía `options.pathToClaudeCodeExecutable`. Costo: ~225MB extra en el installer, pero es lo que hace que el chat funcione offline sin tener `claude` instalado en el sistema.
+
+### Telemetría off por default
+
+El sidecar setea `HYPERFRAMES_TELEMETRY=""` antes de spawnear el CLI, y el CLI fuerza `VITE_HYPERFRAMES_NO_TELEMETRY=1` en el SPA cuando esa env var no está activa. Re-habilitarla requiere intervención explícita del usuario.
+
+## Signing & release
+
+Para releasear firmado necesitas, una sola vez por proyecto:
+
+**1. Llave de firma del updater (requerida para auto-update)**
+
+```bash
+bunx tauri signer generate -w ~/.tauri/hyperframes-desktop.key
+
+# Pega la pubkey resultante en:
+# packages/desktop/src-tauri/tauri.conf.json → plugins.updater.pubkey
+
+# Secrets de GitHub:
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/hyperframes-desktop.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --body "<passphrase>"
+```
+
+Si pierdes el `.key`, ningún install existente puede recibir updates jamás. Guárdalo en 1Password / Vault.
+
+**2. Windows Authenticode (.pfx)**
+
+Cert de DigiCert / Sectigo / SSL.com. EV resetea la reputación de SmartScreen al toque; standard requiere warmup.
+
+```bash
+base64 -w 0 hyperframes.pfx | gh secret set WINDOWS_CERTIFICATE
+gh secret set WINDOWS_CERTIFICATE_PASSWORD --body "<pfx-password>"
+```
+
+**3. macOS code signing + notarization**
+
+Apple Developer Program ($99/yr).
+
+```bash
+base64 -w 0 developer-id.p12 | gh secret set APPLE_CERTIFICATE
+gh secret set APPLE_CERTIFICATE_PASSWORD --body "<p12-password>"
+gh secret set APPLE_SIGNING_IDENTITY --body "Developer ID Application: HyperFrames (TEAMID)"
+gh secret set APPLE_ID --body "you@example.com"
+gh secret set APPLE_PASSWORD --body "<app-specific-password>"
+gh secret set APPLE_TEAM_ID --body "TEAMID"
+```
+
+## Lo que NO va en el desktop
+
+- `hyperframes lambda *` — requiere AWS, es otra superficie de distribución.
+- Los comandos `snapshot` / `remove-background` — usan native modules (sharp, onnxruntime-node) externalizados del compile. Si quieres soportarlos, hay que shippear `node_modules/` adjacente al binario.
+- Skills del agente (`/hyperframes`, `/tailwind`, etc.) — se distribuyen vía `npx skills add` y apuntan a herramientas externas (Claude Code, Cursor). El Studio funciona sin ellas.

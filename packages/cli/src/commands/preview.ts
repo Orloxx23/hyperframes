@@ -16,7 +16,15 @@ export const examples: Example[] = [
   ["List all active preview servers", "hyperframes preview --list"],
   ["Kill all active preview servers", "hyperframes preview --kill-all"],
 ];
-import { existsSync, lstatSync, symlinkSync, unlinkSync, readlinkSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  symlinkSync,
+  unlinkSync,
+  readlinkSync,
+  mkdirSync,
+  readdirSync,
+} from "node:fs";
 import { resolve, dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -169,6 +177,10 @@ export default defineCommand({
       return;
     }
 
+    // Workspace mode: when the target directory has no index.html we treat it
+    // as a folder of projects (the Studio splash renders a project picker).
+    const workspaceMode = !existsSync(join(dir, "index.html"));
+
     if (isDevMode()) {
       return runDevMode(dir, {
         projectName,
@@ -176,6 +188,7 @@ export default defineCommand({
         browserPath,
         userDataDir,
         remoteDebuggingPort,
+        workspaceMode,
       });
     }
 
@@ -187,6 +200,7 @@ export default defineCommand({
         browserPath,
         userDataDir,
         remoteDebuggingPort,
+        workspaceMode,
       });
     }
 
@@ -198,6 +212,7 @@ export default defineCommand({
       browserPath,
       userDataDir,
       remoteDebuggingPort,
+      workspaceMode,
     });
   },
 });
@@ -213,40 +228,58 @@ async function runDevMode(
     browserPath?: string;
     userDataDir?: string;
     remoteDebuggingPort?: number;
+    workspaceMode?: boolean;
   },
 ): Promise<void> {
   // Find monorepo root by navigating from packages/cli/src/commands/
   const thisFile = fileURLToPath(import.meta.url);
   const repoRoot = resolve(dirname(thisFile), "..", "..", "..", "..");
 
-  // Symlink project into the studio's data directory
+  // Symlink the target into the studio's fixed data directory.
+  //
+  // - Single-project mode: link `dir` as a single project under `projectsDir`.
+  // - Workspace mode (no index.html in `dir`): link every direct subdirectory
+  //   that contains an index.html as its own project. The Studio splash then
+  //   sees them as the workspace's project list.
   const projectsDir = join(repoRoot, "packages", "studio", "data", "projects");
   const pName = options?.projectName ?? basename(dir);
-  const symlinkPath = join(projectsDir, pName);
 
   mkdirSync(projectsDir, { recursive: true });
 
-  let createdSymlink = false;
-  if (dir !== symlinkPath) {
+  const createdSymlinks: string[] = [];
+  function linkOne(sourceDir: string, linkName: string): void {
+    const symlinkPath = join(projectsDir, linkName);
+    if (sourceDir === symlinkPath) return;
     if (existsSync(symlinkPath)) {
       try {
         const stat = lstatSync(symlinkPath);
         if (stat.isSymbolicLink()) {
           const target = readlinkSync(symlinkPath);
-          if (resolve(target) !== resolve(dir)) {
-            unlinkSync(symlinkPath);
-          }
+          if (resolve(target) !== resolve(sourceDir)) unlinkSync(symlinkPath);
         }
-        // If it's a real directory, leave it alone
       } catch {
-        // Not a symlink — don't touch it
+        // Not a symlink — leave it alone.
       }
     }
-
     if (!existsSync(symlinkPath)) {
-      symlinkSync(dir, symlinkPath, "dir");
-      createdSymlink = true;
+      symlinkSync(sourceDir, symlinkPath, "dir");
+      createdSymlinks.push(symlinkPath);
     }
+  }
+
+  if (options?.workspaceMode) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const sub = join(dir, entry.name);
+        if (!existsSync(join(sub, "index.html"))) continue;
+        linkOne(sub, entry.name);
+      }
+    } catch {
+      // workspace dir may not exist yet; the splash handles empty workspaces.
+    }
+  } else {
+    linkOne(dir, pName);
   }
 
   clack.intro(c.bold("hyperframes preview"));
@@ -279,7 +312,7 @@ async function runDevMode(
       console.log();
 
       if (!options?.noOpen) {
-        const urlToOpen = `${frontendUrl}#project/${pName}`;
+        const urlToOpen = options?.workspaceMode ? frontendUrl : `${frontendUrl}#project/${pName}`;
         openBrowser(urlToOpen, {
           browserPath: options?.browserPath,
           userDataDir: options?.userDataDir,
@@ -301,12 +334,14 @@ async function runDevMode(
     console.error(c.dim(err.message));
   });
 
-  if (createdSymlink) {
+  if (createdSymlinks.length > 0) {
     process.on("exit", () => {
-      try {
-        if (existsSync(symlinkPath)) unlinkSync(symlinkPath);
-      } catch {
-        /* ignore */
+      for (const link of createdSymlinks) {
+        try {
+          if (existsSync(link)) unlinkSync(link);
+        } catch {
+          /* ignore */
+        }
       }
     });
   }
@@ -353,28 +388,45 @@ async function runLocalStudioMode(
     browserPath?: string;
     userDataDir?: string;
     remoteDebuggingPort?: number;
+    workspaceMode?: boolean;
   },
 ): Promise<void> {
   const req = createRequire(join(dir, "package.json"));
   const studioPkgPath = dirname(req.resolve("@hyperframes/studio/package.json"));
   const pName = options?.projectName ?? basename(dir);
 
-  // Symlink project into studio's data directory
+  // Symlink the target into the studio's data directory. Workspace mode
+  // links each subdirectory containing an index.html; single-project mode
+  // links the directory itself.
   const projectsDir = join(studioPkgPath, "data", "projects");
-  const symlinkPath = join(projectsDir, pName);
   mkdirSync(projectsDir, { recursive: true });
 
-  let createdSymlink = false;
-  if (dir !== symlinkPath) {
+  const createdSymlinks: string[] = [];
+  function linkOne(sourceDir: string, linkName: string): void {
+    const symlinkPath = join(projectsDir, linkName);
+    if (sourceDir === symlinkPath) return;
     if (existsSync(symlinkPath) && lstatSync(symlinkPath).isSymbolicLink()) {
-      if (resolve(readlinkSync(symlinkPath)) !== resolve(dir)) {
-        unlinkSync(symlinkPath);
-      }
+      if (resolve(readlinkSync(symlinkPath)) !== resolve(sourceDir)) unlinkSync(symlinkPath);
     }
     if (!existsSync(symlinkPath)) {
-      symlinkSync(dir, symlinkPath, "dir");
-      createdSymlink = true;
+      symlinkSync(sourceDir, symlinkPath, "dir");
+      createdSymlinks.push(symlinkPath);
     }
+  }
+
+  if (options?.workspaceMode) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const sub = join(dir, entry.name);
+        if (!existsSync(join(sub, "index.html"))) continue;
+        linkOne(sub, entry.name);
+      }
+    } catch {
+      /* workspace dir may not exist yet — splash handles empty workspaces */
+    }
+  } else {
+    linkOne(dir, pName);
   }
 
   clack.intro(c.bold("hyperframes preview") + c.dim(" (local studio)"));
@@ -396,13 +448,18 @@ async function runLocalStudioMode(
       const url = localMatch[1] ?? "";
       s.stop(c.success("Studio running"));
       console.log();
-      console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+      if (options?.workspaceMode) {
+        console.log(`  ${c.dim("Workspace")}  ${c.accent(dir)}`);
+      } else {
+        console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+      }
       console.log(`  ${c.dim("Studio")}    ${c.accent(url)}`);
       console.log();
       console.log(`  ${c.dim("Press Ctrl+C to stop")}`);
       console.log();
       if (!options?.noOpen) {
-        openBrowser(`${url}#project/${pName}`, {
+        const target = options?.workspaceMode ? url : `${url}#project/${pName}`;
+        openBrowser(target, {
           browserPath: options?.browserPath,
           userDataDir: options?.userDataDir,
           remoteDebuggingPort: options?.remoteDebuggingPort,
@@ -418,12 +475,14 @@ async function runLocalStudioMode(
     console.error(c.dim(err.message));
   });
 
-  if (createdSymlink) {
+  if (createdSymlinks.length > 0) {
     process.on("exit", () => {
-      try {
-        if (existsSync(symlinkPath)) unlinkSync(symlinkPath);
-      } catch {
-        /* ignore */
+      for (const link of createdSymlinks) {
+        try {
+          if (existsSync(link)) unlinkSync(link);
+        } catch {
+          /* ignore */
+        }
       }
     });
   }
@@ -457,6 +516,7 @@ async function runEmbeddedMode(
     browserPath?: string;
     userDataDir?: string;
     remoteDebuggingPort?: number;
+    workspaceMode?: boolean;
   },
 ): Promise<void> {
   const { createStudioServer, loadPreviewServerBuildSignature, resolveStudioBundle } =
@@ -508,7 +568,11 @@ async function runEmbeddedMode(
     const url = `http://localhost:${result.port}`;
     s.stop(c.success("Already running"));
     console.log();
-    console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+    if (options?.workspaceMode) {
+      console.log(`  ${c.dim("Workspace")}  ${c.accent(dir)}`);
+    } else {
+      console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+    }
     console.log(`  ${c.dim("Studio")}    ${c.accent(url)}`);
     console.log();
     console.log(
@@ -516,7 +580,8 @@ async function runEmbeddedMode(
     );
     console.log();
     if (!options?.noOpen) {
-      openBrowser(`${url}#project/${pName}`, {
+      const target = options?.workspaceMode ? url : `${url}#project/${pName}`;
+      openBrowser(target, {
         browserPath: options?.browserPath,
         userDataDir: options?.userDataDir,
         remoteDebuggingPort: options?.remoteDebuggingPort,
@@ -532,16 +597,25 @@ async function runEmbeddedMode(
     console.log(`  ${c.warn(`Port ${startPort} is in use, using ${result.port} instead`)}`);
     console.log();
   }
-  console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+  if (options?.workspaceMode) {
+    console.log(`  ${c.dim("Workspace")}  ${c.accent(dir)}`);
+  } else {
+    console.log(`  ${c.dim("Project")}   ${c.accent(pName)}`);
+  }
   console.log(`  ${c.dim("Studio")}    ${c.accent(url)}`);
   console.log();
-  console.log(`  ${c.dim("Edit with your AI agent — it has HyperFrames skills installed.")}`);
-  console.log(`  ${c.dim("Changes reload automatically in the studio.")}`);
+  if (options?.workspaceMode) {
+    console.log(`  ${c.dim("Pick or create a project from the splash to start editing.")}`);
+  } else {
+    console.log(`  ${c.dim("Edit with your AI agent — it has HyperFrames skills installed.")}`);
+    console.log(`  ${c.dim("Changes reload automatically in the studio.")}`);
+  }
   console.log();
   console.log(`  ${c.dim("Press Ctrl+C to stop")}`);
   console.log();
   if (!options?.noOpen) {
-    openBrowser(`${url}#project/${pName}`, {
+    const target = options?.workspaceMode ? url : `${url}#project/${pName}`;
+    openBrowser(target, {
       browserPath: options?.browserPath,
       userDataDir: options?.userDataDir,
       remoteDebuggingPort: options?.remoteDebuggingPort,

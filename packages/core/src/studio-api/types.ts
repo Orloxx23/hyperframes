@@ -117,4 +117,36 @@ export interface StudioApiAdapter {
     project: ResolvedProject;
     blockName: string;
   }): Promise<{ written: string[]; block: RegistryItem }>;
+
+  /**
+   * Optional: workspace info. When defined, the adapter is hosting multiple
+   * projects out of a single root directory. The Studio UI uses `mode` to
+   * decide whether to render the project picker on startup.
+   */
+  getWorkspaceInfo?: () => Promise<WorkspaceInfo> | WorkspaceInfo;
+
+  /**
+   * Optional: change the active workspace root. After a successful update the
+   * adapter should rescan and `listProjects()` should reflect the new root.
+   */
+  setWorkspaceRoot?: (root: string) => Promise<WorkspaceInfo>;
+
+  /**
+   * Optional: create a blank project inside the active workspace. Returns the
+   * newly resolved project so the UI can navigate straight to it.
+   */
+  createBlankProject?: (opts: {
+    name: string;
+    resolution?: CanvasResolution;
+  }) => Promise<ResolvedProject>;
+}
+
+/**
+ * Workspace info reported by the adapter. `mode: "workspace"` toggles the
+ * project picker in the UI; `mode: "single"` preserves the legacy behavior
+ * where the editor jumps straight into the only available project.
+ */
+export interface WorkspaceInfo {
+  mode: "single" | "workspace";
+  root: string | null;
 }

@@ -1,0 +1,27 @@
+{
+  "name": "@hyperframes/desktop",
+  "version": "0.6.51",
+  "private": true,
+  "description": "HyperFrames Studio packaged as a Tauri v2 desktop app",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "prepare:all": "bun run prepare:cli && bun run prepare:studio && bun run prepare:claude-cli && bun run prepare:chromium && bun run prepare:ffmpeg",
+    "prepare:cli": "tsx scripts/prepare-binaries.ts",
+    "prepare:studio": "tsx scripts/prepare-studio.ts",
+    "prepare:claude-cli": "tsx scripts/prepare-claude-cli.ts",
+    "prepare:chromium": "tsx scripts/prepare-chromium.ts",
+    "prepare:ffmpeg": "tsx scripts/prepare-ffmpeg.ts",
+    "clean": "tsx scripts/clean.ts"
+  },
+  "devDependencies": {
+    "@puppeteer/browsers": "^2.13.0",
+    "@tauri-apps/cli": "^2.1.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0"
+  }
+}

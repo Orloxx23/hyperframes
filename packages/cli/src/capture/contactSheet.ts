@@ -5,7 +5,24 @@
  * Saves 50-65% tokens vs. AI agents reading images individually.
  */
 
-import sharp from "sharp";
+// Lazy-loaded — `sharp` is a heavy native module that fails to resolve when
+// the CLI is single-file-compiled (e.g. `bun build --compile`). Loading it at
+// top-level would crash `hyperframes --version` inside the desktop sidecar
+// even though preview/render never call into contact-sheet codepaths.
+//
+// The type plumbing accommodates both dual-emit shapes the sharp package has
+// shipped over time: some versions expose the callable as the module itself
+// (`typeof import("sharp")`), others project it onto a synthetic `default`
+// key via esModuleInterop.
+type SharpModule = typeof import("sharp");
+type SharpFn = SharpModule extends { default: infer D } ? D : SharpModule;
+let _sharp: SharpFn | undefined;
+async function getSharp(): Promise<SharpFn> {
+  if (_sharp) return _sharp;
+  const mod = (await import("sharp")) as SharpModule & { default?: SharpFn };
+  _sharp = (mod.default ?? (mod as unknown as SharpFn)) as SharpFn;
+  return _sharp;
+}
 import { readdirSync, readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { join, extname, basename, dirname } from "node:path";
 
@@ -42,6 +59,8 @@ export async function createContactSheet(
   const files = imagePaths.slice(0, maxImages);
   if (files.length === 0) return null;
 
+  const sharp = await getSharp();
+
   // Read first image to determine aspect ratio
   const firstMeta = await sharp(files[0]!).metadata();
   const srcW = firstMeta.width || 1920;
@@ -57,7 +76,7 @@ export async function createContactSheet(
   const totalW = cols * cellW + (cols + 1) * padding;
   const totalH = rows * (cellH + labelH) + (rows + 1) * padding;
 
-  const overlays: sharp.OverlayOptions[] = [];
+  const overlays: import("sharp").OverlayOptions[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const col = i % cols;
@@ -290,6 +309,8 @@ export async function createSvgContactSheet(
   if (svgPaths.length === 0) return [];
 
   const svgFileNames = svgPaths.map((p) => p.split("/").pop()!);
+
+  const sharp = await getSharp();
 
   // Render ALL SVGs to PNG thumbnails first, then paginate the sheets
   const thumbSize = 200;

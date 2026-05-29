@@ -15,8 +15,13 @@ import {
   type ResolvedProject,
   type RenderJobState,
   type StudioApiAdapter,
+  type WorkspaceInfo,
 } from "@hyperframes/core/studio-api";
 import type { RegistryItem } from "@hyperframes/core/registry";
+import {
+  buildBlankProjectFiles,
+  sanitizeProjectName,
+} from "../core/src/studio-api/helpers/blankProject";
 import { createProjectSignature } from "../core/src/studio-api/helpers/projectSignature";
 import { createRetryingModuleLoader, ensureProducerDist } from "./vite.producer";
 import { createStudioDevRenderBodyScripts } from "./vite.studioMotion";
@@ -28,6 +33,16 @@ export function isPathWithin(parentDir: string, childPath: string): boolean {
     childRelativePath === "" ||
     (!childRelativePath.startsWith("..") && !isAbsolute(childRelativePath))
   );
+}
+
+function writeBlankProjectFiles(
+  destDir: string,
+  projectName: string,
+  resolution: import("../core/src/core.types").CanvasResolution,
+): void {
+  const files = buildBlankProjectFiles({ name: projectName, resolution });
+  writeFileSync(join(destDir, "index.html"), files["index.html"], "utf-8");
+  writeFileSync(join(destDir, "meta.json"), files["meta.json"], "utf-8");
 }
 
 export function createViteAdapter(dataDir: string, server: ViteDevServer): StudioApiAdapter {
@@ -323,6 +338,27 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       }
 
       return { written, block };
+    },
+
+    getWorkspaceInfo(): WorkspaceInfo {
+      return { mode: "workspace", root: dataDir };
+    },
+
+    async createBlankProject({ name, resolution }) {
+      const safeName = sanitizeProjectName(name);
+      if (!safeName) throw new Error("Project name contains no usable characters");
+      const dest = join(dataDir, safeName);
+      if (existsSync(dest)) {
+        throw new Error(`A project named "${safeName}" already exists`);
+      }
+      mkdirSync(dest, { recursive: true });
+      writeBlankProjectFiles(dest, safeName, resolution ?? "landscape");
+      try {
+        server.watcher.add(dest);
+      } catch {
+        /* watcher may fail on broken symlinks — non-fatal */
+      }
+      return { id: safeName, dir: realpathSync(dest), title: safeName } satisfies ResolvedProject;
     },
   };
 }

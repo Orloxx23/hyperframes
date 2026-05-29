@@ -1,4 +1,4 @@
-import type { MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { RotateCcw, RotateCw, Camera } from "../icons/SystemIcons";
 import {
   STUDIO_INSPECTOR_PANELS_ENABLED,
@@ -148,19 +148,49 @@ export function StudioHeader({
   inspectorButtonActive,
   inspectorPanelActive,
 }: StudioHeaderProps) {
-  const { projectId, editHistory, handleUndo, handleRedo } = useStudioContext();
+  const {
+    projectId,
+    workspace,
+    projects,
+    openProject,
+    returnToSplash,
+    refreshProjects,
+    editHistory,
+    handleUndo,
+    handleRedo,
+    agentPanelOpen,
+    toggleAgentPanel,
+    renderQueue,
+  } = useStudioContext();
   const { rightCollapsed, setRightCollapsed, setRightPanelTab } = usePanelLayoutContext();
+  const openExportPanel = () => {
+    trackStudioEvent("toolbar_action", { action: "open_export" });
+    setRightPanelTab("renders");
+    setRightCollapsed(false);
+  };
+  const isExporting = renderQueue.isRendering;
   const { clearDomSelection } = useDomEditContext();
+  const workspaceMode = workspace?.mode === "workspace";
 
   return (
     <div className="flex items-center justify-between h-10 px-3 bg-neutral-900 border-b border-neutral-800 flex-shrink-0">
-      {/* Left: logo + project name */}
+      {/* Left: logo + project switcher */}
       <div className="flex items-center gap-3">
         <HyperframesLogo />
         <span className="text-neutral-700 select-none" aria-hidden="true">
           |
         </span>
-        <span className="text-[11px] font-medium text-neutral-300">{projectId}</span>
+        {workspaceMode ? (
+          <ProjectSwitcher
+            currentProjectId={projectId}
+            projects={projects}
+            onOpenProject={openProject}
+            onReturnToSplash={returnToSplash}
+            onRefresh={refreshProjects}
+          />
+        ) : (
+          <span className="text-[11px] font-medium text-neutral-300">{projectId}</span>
+        )}
       </div>
       {/* Right: toolbar buttons */}
       <div className="flex items-center gap-1.5">
@@ -224,6 +254,43 @@ export function StudioHeader({
         </a>
         <button
           type="button"
+          onClick={openExportPanel}
+          className={`h-7 flex items-center gap-1.5 px-2.5 rounded-md text-[11px] font-medium border transition-colors ${
+            isExporting
+              ? "border-studio-accent/40 text-studio-accent bg-studio-accent/10"
+              : "border-studio-accent/60 text-studio-accent bg-studio-accent/10 hover:bg-studio-accent/20"
+          }`}
+          title={isExporting ? "Rendering — open Renders panel" : "Export video"}
+          aria-label="Export video"
+        >
+          <ExportIcon spinning={isExporting} />
+          <span>{isExporting ? "Rendering…" : "Export"}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            trackStudioEvent("panel_toggle", { panel: "agent", collapsed: agentPanelOpen });
+            toggleAgentPanel();
+          }}
+          className={`h-7 flex items-center gap-1.5 px-2.5 rounded-md text-[11px] font-medium border transition-colors ${
+            agentPanelOpen
+              ? "text-studio-accent bg-studio-accent/10 border-studio-accent/30"
+              : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 border-transparent"
+          }`}
+          title="AI editor"
+          aria-label="Toggle AI editor"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 2L13.5 8.5L20 10L13.5 11.5L12 18L10.5 11.5L4 10L10.5 8.5L12 2Z" />
+            <path
+              d="M19 14L19.75 16.25L22 17L19.75 17.75L19 20L18.25 17.75L16 17L18.25 16.25L19 14Z"
+              opacity="0.6"
+            />
+          </svg>
+          AI
+        </button>
+        <button
+          type="button"
           onClick={() => {
             if (!STUDIO_INSPECTOR_PANELS_ENABLED) return;
             if (rightCollapsed || !inspectorPanelActive) {
@@ -266,5 +333,166 @@ export function StudioHeader({
         </button>
       </div>
     </div>
+  );
+}
+
+interface ProjectSwitcherProps {
+  currentProjectId: string;
+  projects: import("../hooks/useServerConnection").ProjectSummary[];
+  onOpenProject: (id: string) => void;
+  onReturnToSplash: () => void;
+  onRefresh: () => Promise<void> | void;
+}
+
+function ProjectSwitcher({
+  currentProjectId,
+  projects,
+  onOpenProject,
+  onReturnToSplash,
+  onRefresh,
+}: ProjectSwitcherProps) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  // Refresh the list each time the menu opens so a project created elsewhere
+  // (e.g. via the CLI) shows up without a full reload.
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    if (!open) return;
+    void onRefresh();
+  }, [open, onRefresh]);
+
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: globalThis.MouseEvent) {
+      if (!rootRef.current) return;
+      if (rootRef.current.contains(e.target as Node)) return;
+      setOpen(false);
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const current = projects.find((p) => p.id === currentProjectId);
+  const label = current?.title ?? currentProjectId;
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="h-7 px-2 flex items-center gap-1.5 rounded-md text-[11px] font-medium text-neutral-300 hover:bg-neutral-800 border border-transparent hover:border-neutral-700 transition-colors"
+        title="Switch project"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <span className="truncate max-w-[180px]">{label}</span>
+        <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+          <path
+            d="M3 4.5L6 7.5L9 4.5"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute left-0 top-full mt-1 z-50 w-64 rounded-md border border-neutral-800 bg-neutral-950 shadow-xl py-1"
+        >
+          <div className="px-3 py-2 text-[10px] uppercase tracking-wide text-neutral-600 border-b border-neutral-800/60">
+            Projects in workspace
+          </div>
+          <div className="max-h-64 overflow-auto py-1">
+            {projects.length === 0 ? (
+              <div className="px-3 py-3 text-xs text-neutral-500">No projects available.</div>
+            ) : (
+              projects.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setOpen(false);
+                    if (p.id !== currentProjectId) onOpenProject(p.id);
+                  }}
+                  className={`w-full text-left px-3 py-1.5 text-xs transition-colors ${
+                    p.id === currentProjectId
+                      ? "bg-neutral-900 text-neutral-100"
+                      : "text-neutral-300 hover:bg-neutral-900"
+                  }`}
+                >
+                  <div className="truncate">{p.title ?? p.id}</div>
+                  {p.title && p.title !== p.id && (
+                    <div className="text-[10px] text-neutral-600 font-mono truncate">{p.id}</div>
+                  )}
+                </button>
+              ))
+            )}
+          </div>
+          <div className="border-t border-neutral-800/60 py-1">
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onReturnToSplash();
+              }}
+              className="w-full text-left px-3 py-1.5 text-xs text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200 transition-colors"
+            >
+              Back to project picker…
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExportIcon({ spinning }: { spinning?: boolean }) {
+  if (spinning) {
+    return (
+      <svg
+        width="12"
+        height="12"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        aria-hidden="true"
+        className="animate-spin"
+      >
+        <path d="M21 12a9 9 0 1 1-3-6.7" />
+      </svg>
+    );
+  }
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3v12" />
+      <path d="m7 8 5-5 5 5" />
+      <path d="M5 21h14" />
+    </svg>
   );
 }

@@ -61,13 +61,37 @@ function devProjectApi(): Plugin {
     name: "studio-dev-api",
     configureServer(server): void {
       let _api: { fetch: (req: Request) => Promise<Response> } | null = null;
+      let _agentRoutesLoaded = false;
+      let _agentRoutesError: string | null = null;
       const getApi = async () => {
-        if (!_api) {
-          const mod = await server.ssrLoadModule("@hyperframes/core/studio-api");
-          const adapter = createViteAdapter(dataDir, server);
-          _api = mod.createStudioApi(adapter);
+        // Only cache the api once agent routes load successfully — otherwise
+        // every credentials request would 404 until the user manually
+        // restarts Vite. By retrying on each request after a failure, the
+        // user can fix the import issue and just refresh the page.
+        if (_api && _agentRoutesLoaded) return { api: _api, error: null as string | null };
+
+        const mod = await server.ssrLoadModule("@hyperframes/core/studio-api");
+        const adapter = createViteAdapter(dataDir, server);
+        const api = _api ?? mod.createStudioApi(adapter);
+
+        if (!_agentRoutesLoaded) {
+          try {
+            const agentMod = await server.ssrLoadModule("../cli/src/agent/routes");
+            (agentMod.registerAgentRoutes as (a: unknown, b: unknown, c: string) => void)(
+              api,
+              adapter,
+              "",
+            );
+            _agentRoutesLoaded = true;
+            _agentRoutesError = null;
+          } catch (err) {
+            _agentRoutesError = err instanceof Error ? err.stack || err.message : String(err);
+            console.error("[Studio] Failed to load agent routes:\n", _agentRoutesError);
+          }
         }
-        return _api;
+
+        _api = api;
+        return { api, error: _agentRoutesError };
       };
 
       // Runtime endpoint — prefer source build over dist artifact
@@ -102,7 +126,22 @@ function devProjectApi(): Plugin {
       server.middlewares.use(async (req, res, next) => {
         if (!req.url?.startsWith("/api/")) return next();
         try {
-          const api = await getApi();
+          const { api, error: agentLoadError } = await getApi();
+          // If a credentials request hits the API but the agent routes
+          // module failed to load (the part that registers them), respond
+          // with the actual loader error so the user sees it instead of a
+          // confusing 404. Without this, requests fall through to Hono's
+          // default `404 Not Found` plain-text response and the chat panel
+          // says "Endpoint not found" with no clue about the real cause.
+          if (agentLoadError && req.url.startsWith("/api/credentials")) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: `Agent routes failed to load in dev. Check the Vite terminal for "[Studio] Failed to load agent routes". Excerpt: ${agentLoadError.split("\n").slice(0, 3).join(" | ").slice(0, 400)}`,
+              }),
+            );
+            return;
+          }
           const url = new URL(req.url, `http://${req.headers.host}`);
           url.pathname = url.pathname.slice(4);
           let body: Buffer | undefined;

@@ -12,6 +12,8 @@ describe("@hyperframes/core public API exports", () => {
       expect(core.CANVAS_DIMENSIONS["portrait-4k"]).toEqual({ width: 2160, height: 3840 });
       expect(core.CANVAS_DIMENSIONS.square).toEqual({ width: 1080, height: 1080 });
       expect(core.CANVAS_DIMENSIONS["square-4k"]).toEqual({ width: 2160, height: 2160 });
+      expect(core.CANVAS_DIMENSIONS["portrait-4-5"]).toEqual({ width: 1080, height: 1350 });
+      expect(core.CANVAS_DIMENSIONS["portrait-2-3"]).toEqual({ width: 1080, height: 1620 });
     });
 
     it("exports VALID_CANVAS_RESOLUTIONS derived from CANVAS_DIMENSIONS", () => {
@@ -22,6 +24,8 @@ describe("@hyperframes/core public API exports", () => {
         "portrait-4k",
         "square",
         "square-4k",
+        "portrait-4-5",
+        "portrait-2-3",
       ]);
     });
 

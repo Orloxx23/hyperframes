@@ -2,14 +2,22 @@
  * Embedded studio server for `hyperframes preview` outside the monorepo.
  *
  * Uses the shared studio API module from @hyperframes/core/studio-api,
- * providing a CLI-specific adapter for single-project, in-process rendering.
+ * providing a CLI-specific adapter that runs renders in-process. The same
+ * adapter supports two layouts:
+ *
+ *   - Single-project: the target directory contains an `index.html`. The
+ *     Studio jumps straight into the editor.
+ *   - Workspace: the target directory has no `index.html` of its own, just
+ *     subdirectories that do. The Studio renders a splash picker, and new
+ *     projects created from the UI land as fresh subdirectories.
  */
 
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
-import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, readdirSync, mkdirSync } from "node:fs";
 import { resolve, join, basename } from "node:path";
 import { createProjectWatcher, type ProjectWatcher } from "./fileWatcher.js";
+import { registerAgentRoutes } from "../agent/routes.js";
 import {
   hashSignatureParts,
   loadRuntimeSource,
@@ -22,10 +30,14 @@ import {
   createStudioApi,
   createProjectSignature,
   getMimeType,
+  buildBlankProjectFiles,
+  sanitizeProjectName,
   type StudioApiAdapter,
   type ResolvedProject,
   type RenderJobState,
+  type WorkspaceInfo,
 } from "@hyperframes/core/studio-api";
+import { type CanvasResolution } from "@hyperframes/core";
 import { getElementScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
 import type { ScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
 
@@ -45,6 +57,17 @@ export interface StudioBundleResolution {
 }
 
 export function resolveStudioBundle(): StudioBundleResolution {
+  // Env override — used by the desktop sidecar where the binary is single-file
+  // compiled (bun --compile) and `__dirname` resolves to a virtual fs that
+  // never contains the studio's static assets. The desktop shell sets this to
+  // the bundled resource directory before spawning the sidecar.
+  const envPath = process.env.HYPERFRAMES_STUDIO_DIR;
+  if (envPath) {
+    const envIndex = resolve(envPath, "index.html");
+    if (existsSync(envIndex)) {
+      return { dir: envPath, indexPath: envIndex, available: true, checkedPaths: [envIndex] };
+    }
+  }
   const builtPath = resolve(__dirname, "studio");
   const builtIndex = resolve(builtPath, "index.html");
   if (existsSync(builtIndex)) {
@@ -69,6 +92,10 @@ export function resolveStudioBundle(): StudioBundleResolution {
 }
 
 function resolveRuntimePath(): string {
+  // Env override for the desktop sidecar — see resolveStudioBundle() for the
+  // same compile-mode rationale. Points at the bundled runtime JS file.
+  const envPath = process.env.HYPERFRAMES_RUNTIME_JS;
+  if (envPath && existsSync(envPath)) return envPath;
   const builtPath = resolve(__dirname, "hyperframe-runtime.js");
   if (existsSync(builtPath)) return builtPath;
   const iifePath = resolve(__dirname, "hyperframe.runtime.iife.js");
@@ -175,6 +202,23 @@ export async function closeThumbnailBrowser(): Promise<void> {
   await releaseBrowser(browser).catch(() => {});
 }
 
+// ── Workspace helpers ───────────────────────────────────────────────────────
+
+function isPathWithin(parent: string, child: string): boolean {
+  const rel = resolve(child).slice(resolve(parent).length);
+  return rel === "" || rel.startsWith("/") || rel.startsWith("\\");
+}
+
+function writeBlankProjectFiles(
+  destDir: string,
+  projectName: string,
+  resolution: CanvasResolution,
+): void {
+  const files = buildBlankProjectFiles({ name: projectName, resolution });
+  writeFileSync(join(destDir, "index.html"), files["index.html"], "utf-8");
+  writeFileSync(join(destDir, "meta.json"), files["meta.json"], "utf-8");
+}
+
 // ── Server factory ──────────────────────────────────────────────────────────
 
 export interface StudioServerOptions {
@@ -209,23 +253,134 @@ export async function loadPreviewServerBuildSignature(): Promise<string> {
 
 export function createStudioServer(options: StudioServerOptions): StudioServer {
   const { projectDir, projectName } = options;
-  const projectId = projectName || basename(projectDir);
   const studioDir = resolveDistDir();
   const runtimePath = resolveRuntimePath();
-  const watcher = createProjectWatcher(projectDir);
 
-  // ── CLI adapter for the shared studio API ──────────────────────────────
+  // ── Workspace state ────────────────────────────────────────────────────
+  // `projectDir` is treated as the workspace root. If it contains an
+  // index.html we keep the legacy "single project" behavior; otherwise we
+  // operate in workspace mode where each subdirectory with an index.html
+  // is a separate project, and the UI shows a picker on the splash.
 
-  const project: ResolvedProject = { id: projectId, dir: projectDir, title: projectId };
-  let cachedProjectSignature: string | null = null;
-  watcher.addListener(() => {
-    cachedProjectSignature = null;
+  let activeRootDir = resolve(projectDir);
+  const signatureCache = new Map<string, string>();
+
+  // Watcher indirection: SSE clients register listeners against `watcher`
+  // (the dispatcher) once at connection time, but the underlying fs.watch
+  // can be replaced when the user switches workspace root. The dispatcher
+  // forwards events from whichever inner watcher is active.
+  const dispatchListeners = new Set<(path: string) => void>();
+  let innerWatcher: ProjectWatcher = createProjectWatcher(activeRootDir);
+  innerWatcher.addListener((p) => {
+    signatureCache.clear();
+    for (const fn of dispatchListeners) fn(p);
   });
+  const watcher: ProjectWatcher = {
+    addListener: (fn) => dispatchListeners.add(fn),
+    removeListener: (fn) => dispatchListeners.delete(fn),
+    close: () => {
+      innerWatcher.close();
+      dispatchListeners.clear();
+    },
+  };
+
+  function replaceInnerWatcher(nextRoot: string): void {
+    innerWatcher.close();
+    innerWatcher = createProjectWatcher(nextRoot);
+    innerWatcher.addListener((p) => {
+      signatureCache.clear();
+      for (const fn of dispatchListeners) fn(p);
+    });
+  }
+
+  function isProjectDir(dir: string): boolean {
+    return existsSync(join(dir, "index.html"));
+  }
+
+  function detectMode(): "single" | "workspace" {
+    return isProjectDir(activeRootDir) ? "single" : "workspace";
+  }
+
+  function getSingleProject(): ResolvedProject {
+    const id = projectName || basename(activeRootDir);
+    return { id, dir: activeRootDir, title: id };
+  }
+
+  function listWorkspaceProjects(): ResolvedProject[] {
+    if (!existsSync(activeRootDir)) return [];
+    try {
+      return readdirSync(activeRootDir, { withFileTypes: true })
+        .filter(
+          (d) =>
+            (d.isDirectory() || d.isSymbolicLink()) && isProjectDir(join(activeRootDir, d.name)),
+        )
+        .map((d) => ({ id: d.name, dir: join(activeRootDir, d.name), title: d.name }))
+        .sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
+    } catch {
+      return [];
+    }
+  }
+
+  function listAllProjects(): ResolvedProject[] {
+    return detectMode() === "single" ? [getSingleProject()] : listWorkspaceProjects();
+  }
+
+  function resolveWorkspaceProject(id: string): ResolvedProject | null {
+    const dir = join(activeRootDir, id);
+    if (!isPathWithin(activeRootDir, dir)) return null;
+    if (!isProjectDir(dir)) return null;
+    return { id, dir, title: id };
+  }
+
+  function workspaceInfo(): WorkspaceInfo {
+    return { mode: detectMode(), root: activeRootDir };
+  }
 
   const adapter: StudioApiAdapter = {
-    listProjects: () => [project],
+    listProjects: () => listAllProjects(),
 
-    resolveProject: (id: string) => (id === projectId ? project : null),
+    resolveProject: (id: string) => {
+      if (detectMode() === "single") {
+        const single = getSingleProject();
+        return id === single.id ? single : null;
+      }
+      return resolveWorkspaceProject(id);
+    },
+
+    getWorkspaceInfo: () => workspaceInfo(),
+
+    async setWorkspaceRoot(root: string): Promise<WorkspaceInfo> {
+      const next = resolve(root);
+      if (!existsSync(next)) {
+        // Allow creating the workspace dir on first use — friendlier than
+        // forcing the user to mkdir before clicking "Open workspace".
+        mkdirSync(next, { recursive: true });
+      } else if (!statSync(next).isDirectory()) {
+        throw new Error(`Workspace root is not a directory: ${next}`);
+      }
+      if (next === activeRootDir) return workspaceInfo();
+      activeRootDir = next;
+      signatureCache.clear();
+      replaceInnerWatcher(activeRootDir);
+      return workspaceInfo();
+    },
+
+    async createBlankProject({ name, resolution }): Promise<ResolvedProject> {
+      if (detectMode() === "single") {
+        throw new Error("Cannot create new projects in single-project mode");
+      }
+      const safeName = sanitizeProjectName(name);
+      if (!safeName) {
+        throw new Error("Project name contains no usable characters");
+      }
+      const dest = join(activeRootDir, safeName);
+      if (existsSync(dest)) {
+        throw new Error(`A project named "${safeName}" already exists`);
+      }
+      mkdirSync(dest, { recursive: true });
+      writeBlankProjectFiles(dest, safeName, resolution ?? "landscape");
+      return { id: safeName, dir: dest, title: safeName };
+    },
 
     async bundle(dir: string): Promise<string | null> {
       try {
@@ -253,9 +408,12 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     },
 
     getProjectSignature(dir: string): string {
-      if (resolve(dir) !== resolve(projectDir)) return createProjectSignature(dir);
-      cachedProjectSignature ??= createProjectSignature(projectDir);
-      return cachedProjectSignature;
+      const key = resolve(dir);
+      const cached = signatureCache.get(key);
+      if (cached) return cached;
+      const signature = createProjectSignature(key);
+      signatureCache.set(key, signature);
+      return signature;
     },
 
     async lint(html: string, opts?: { filePath?: string }) {
@@ -265,7 +423,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
 
     runtimeUrl: "/api/runtime.js",
 
-    rendersDir: () => join(projectDir, "renders"),
+    rendersDir: (project) => join(project.dir, "renders"),
 
     startRender(opts): RenderJobState {
       const state: RenderJobState = {
@@ -472,8 +630,9 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       const serverBuildSignature = await loadPreviewServerBuildSignature();
       return c.json({
         isHyperframes: true,
-        projectName: projectId,
-        projectDir: projectDir,
+        projectName: projectName || basename(activeRootDir),
+        projectDir: activeRootDir,
+        workspace: workspaceInfo(),
         serverBuildSignature,
         version,
       });
@@ -507,6 +666,11 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       }
     });
   });
+
+  // In-Studio AI chat. CLI-only because credentials live on disk and the
+  // agent loop runs the Anthropic SDK in-process; the dev vite adapter
+  // doesn't have an equivalent yet.
+  registerAgentRoutes(app, adapter);
 
   // Mount the shared studio API at /api.
   // Use fetch() forwarding (not .route()) so the sub-app sees paths without
@@ -543,12 +707,22 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
   // vars were baked at build time. Collect any such vars from the current
   // process.env and inject them as `window.__HF_STUDIO_ENV__` so the client
   // can pick them up at runtime, overriding the baked defaults.
+  //
+  // We also force-disable telemetry by default: anyone running the CLI is
+  // editing locally and shouldn't be opted into PostHog. Setting
+  // `HYPERFRAMES_TELEMETRY=1` in the environment re-enables it for users who
+  // actively want to send anonymous usage stats.
   function buildRuntimeEnvScript(): string {
     const overrides: Record<string, string> = {};
     for (const [key, value] of Object.entries(process.env)) {
       if (key.startsWith("VITE_STUDIO_") && value !== undefined) {
         overrides[key] = value;
       }
+    }
+    const telemetryOptIn =
+      process.env.HYPERFRAMES_TELEMETRY === "1" || process.env.HYPERFRAMES_TELEMETRY === "true";
+    if (!telemetryOptIn) {
+      overrides.VITE_HYPERFRAMES_NO_TELEMETRY = "1";
     }
     if (Object.keys(overrides).length === 0) return "";
     return `<script>window.__HF_STUDIO_ENV__=${JSON.stringify(overrides)};</script>`;

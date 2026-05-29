@@ -160,6 +160,10 @@ export const CANVAS_DIMENSIONS = {
   "portrait-4k": { width: 2160, height: 3840 },
   square: { width: 1080, height: 1080 },
   "square-4k": { width: 2160, height: 2160 },
+  // 4:5 vertical — Instagram feed portrait, LinkedIn feed.
+  "portrait-4-5": { width: 1080, height: 1350 },
+  // 2:3 vertical — Pinterest pin.
+  "portrait-2-3": { width: 1080, height: 1620 },
 } as const;
 
 // Single source of truth: derive the type from the table so adding a preset
@@ -186,6 +190,20 @@ const RESOLUTION_ALIASES: Record<string, CanvasResolution> = {
   "1080p-square": "square",
   "square-1080p": "square",
   "4k-square": "square-4k",
+  // Social-media aliases — let users pass `--resolution tiktok` etc.
+  youtube: "landscape",
+  "youtube-shorts": "portrait",
+  tiktok: "portrait",
+  reels: "portrait",
+  "instagram-reels": "portrait",
+  "instagram-story": "portrait",
+  stories: "portrait",
+  shorts: "portrait",
+  "instagram-feed": "square",
+  "instagram-portrait": "portrait-4-5",
+  "linkedin-feed": "portrait-4-5",
+  "facebook-feed": "portrait-4-5",
+  pinterest: "portrait-2-3",
 };
 
 /**

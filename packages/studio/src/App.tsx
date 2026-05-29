@@ -43,6 +43,7 @@ import { PanelLayoutProvider } from "./contexts/PanelLayoutContext";
 import { FileManagerProvider } from "./contexts/FileManagerContext";
 import { DomEditProvider } from "./contexts/DomEditContext";
 import { StudioSplash } from "./components/StudioSplash";
+import { AgentChatPanel } from "./components/agent/AgentChatPanel";
 import { useServerConnection } from "./hooks/useServerConnection";
 import {
   normalizeStudioCompositionPath,
@@ -52,7 +53,16 @@ import { trackStudioSessionStart } from "./telemetry/events";
 import { hasFiredSessionStart, markSessionStartFired } from "./telemetry/config";
 
 export function StudioApp() {
-  const { projectId, resolving, waitingForServer } = useServerConnection();
+  const {
+    projectId,
+    resolving,
+    waitingForServer,
+    workspace,
+    projects,
+    refresh: refreshProjects,
+    openProject,
+    returnToSplash,
+  } = useServerConnection();
   const initialUrlStateRef = useRef(readStudioUrlStateFromWindow());
 
   // Fire once per browser tab session — sessionStorage-backed so HMR
@@ -125,6 +135,8 @@ export function StudioApp() {
       return !v;
     });
   }, []);
+  const [agentPanelOpen, setAgentPanelOpen] = useState(false);
+  const toggleAgentPanel = useCallback(() => setAgentPanelOpen((v) => !v), []);
   const { appToast, showToast } = useToast();
   const panelLayout = usePanelLayout({
     rightCollapsed: initialUrlStateRef.current.rightCollapsed,
@@ -487,6 +499,11 @@ export function StudioApp() {
   // StudioProvider performs its own useMemo — no need for a second memo here.
   const studioCtxValue: StudioContextValue = {
     projectId: projectId!,
+    workspace,
+    projects,
+    openProject,
+    returnToSplash,
+    refreshProjects,
     activeCompPath,
     setActiveCompPath,
     showToast,
@@ -519,10 +536,20 @@ export function StudioApp() {
     refreshPreviewDocumentVersion,
     timelineVisible,
     toggleTimelineVisibility,
+    agentPanelOpen,
+    toggleAgentPanel,
   };
 
   if (resolving || waitingForServer || !projectId) {
-    return <StudioSplash waiting={waitingForServer} />;
+    return (
+      <StudioSplash
+        waiting={waitingForServer || resolving}
+        workspace={workspace}
+        projects={projects}
+        onOpenProject={openProject}
+        onRefresh={refreshProjects}
+      />
+    );
   }
 
   const timelineToolbar = <TimelineToolbar toggleTimelineVisibility={toggleTimelineVisibility} />;
@@ -601,6 +628,14 @@ export function StudioApp() {
                       setActiveBlockParams(null);
                       panelLayout.setRightPanelTab("design");
                     }}
+                  />
+                )}
+
+                {agentPanelOpen && (
+                  <AgentChatPanel
+                    projectId={projectId}
+                    activeCompPath={activeCompPath}
+                    onClose={toggleAgentPanel}
                   />
                 )}
               </div>

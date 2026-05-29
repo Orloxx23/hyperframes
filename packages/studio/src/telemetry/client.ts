@@ -36,13 +36,26 @@ function isApiKeyConfigured(): boolean {
 // opt-out so HeyGen's own dev/CI builds can suppress telemetry from the studio
 // bundle the same way. Vite injects it at build time. Accepts "1" or "true".
 // `import.meta.env` may be undefined in non-Vite bundlers (Next.js Turbopack).
+//
+// The CLI embedded server also injects the same flag at runtime via
+// `window.__HF_STUDIO_ENV__`, so the Studio is opted out by default whenever
+// it's being served by `hyperframes preview` — the local-first / future
+// desktop-app path. The SaaS deployment doesn't inject the flag and keeps
+// the existing opt-out-via-env behavior.
 function isBuildTimeOptOut(): boolean {
   try {
-    const v = import.meta.env.VITE_HYPERFRAMES_NO_TELEMETRY as string | undefined;
-    return v === "1" || v === "true";
+    const baked = import.meta.env.VITE_HYPERFRAMES_NO_TELEMETRY as string | undefined;
+    if (baked === "1" || baked === "true") return true;
   } catch {
-    return false;
+    /* import.meta.env unavailable outside Vite */
   }
+  if (typeof window !== "undefined") {
+    const runtime = (window as Window & { __HF_STUDIO_ENV__?: Record<string, string | undefined> })
+      .__HF_STUDIO_ENV__;
+    const v = runtime?.VITE_HYPERFRAMES_NO_TELEMETRY;
+    if (v === "1" || v === "true") return true;
+  }
+  return false;
 }
 
 // `import.meta.env.DEV` is true under `vite dev` / `vite preview`. Auto-suppress

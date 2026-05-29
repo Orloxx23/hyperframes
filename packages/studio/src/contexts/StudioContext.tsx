@@ -1,9 +1,15 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type { TimelineElement } from "../player";
 import type { CompositionDimensions } from "../components/renders/RenderQueue";
+import type { ProjectSummary, WorkspaceInfo } from "../hooks/useServerConnection";
 
 export interface StudioContextValue {
   projectId: string;
+  workspace: WorkspaceInfo | null;
+  projects: ProjectSummary[];
+  openProject: (projectId: string) => void;
+  returnToSplash: () => void;
+  refreshProjects: () => Promise<void> | void;
   activeCompPath: string | null;
   setActiveCompPath: (path: string | null) => void;
   showToast: (message: string, tone?: "error" | "info") => void;
@@ -36,6 +42,8 @@ export interface StudioContextValue {
   refreshPreviewDocumentVersion: () => void;
   timelineVisible: boolean;
   toggleTimelineVisibility: () => void;
+  agentPanelOpen: boolean;
+  toggleAgentPanel: () => void;
 }
 
 const StudioContext = createContext<StudioContextValue | null>(null);
@@ -55,6 +63,11 @@ export function StudioProvider({
 }) {
   const {
     projectId,
+    workspace,
+    projects,
+    openProject,
+    returnToSplash,
+    refreshProjects,
     activeCompPath,
     setActiveCompPath,
     showToast,
@@ -76,11 +89,18 @@ export function StudioProvider({
     refreshPreviewDocumentVersion,
     timelineVisible,
     toggleTimelineVisibility,
+    agentPanelOpen,
+    toggleAgentPanel,
   } = value;
 
   const stable = useMemo<StudioContextValue>(
     () => ({
       projectId,
+      workspace,
+      projects,
+      openProject,
+      returnToSplash,
+      refreshProjects,
       activeCompPath,
       setActiveCompPath,
       showToast,
@@ -102,12 +122,19 @@ export function StudioProvider({
       refreshPreviewDocumentVersion,
       timelineVisible,
       toggleTimelineVisibility,
+      agentPanelOpen,
+      toggleAgentPanel,
     }),
     // Representative subset of deps that actually change — stable callbacks
     // (showToast, setActiveCompPath, etc.) are included for correctness but
     // won't trigger re-renders on their own.
     [
       projectId,
+      workspace,
+      projects,
+      openProject,
+      returnToSplash,
+      refreshProjects,
       activeCompPath,
       captionEditMode,
       compositionLoading,
@@ -129,6 +156,8 @@ export function StudioProvider({
       handlePreviewIframeRef,
       refreshPreviewDocumentVersion,
       toggleTimelineVisibility,
+      agentPanelOpen,
+      toggleAgentPanel,
     ],
   );
   return <StudioContext value={stable}>{children}</StudioContext>;
