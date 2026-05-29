@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from "react";
+﻿import { useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import {
   useAgentChat,
   type AssistantBlock,
@@ -44,6 +44,13 @@ export function AgentChatPanel({ projectId, activeCompPath, onClose }: AgentChat
   const [attachedSelection, setAttachedSelection] = useState<DomEditSelection | null>(null);
   const [attachedSnippet, setAttachedSnippet] = useState<string | undefined>();
   const pickerBaselineRef = useRef<HTMLElement | null>(null);
+
+  // Video drop → upload → prefill prompt for skill generation.
+  const [videoUpload, setVideoUpload] = useState<
+    { state: "uploading"; filename: string } | { state: "error"; message: string } | null
+  >(null);
+  const [dragActive, setDragActive] = useState(false);
+  const dragCounterRef = useRef(0);
 
   const claudeReady = chat.authStatus?.claudeCode.ready ?? false;
   const apiKeyConfigured = chat.authStatus?.apiKey.configured ?? false;
@@ -112,6 +119,110 @@ export function AgentChatPanel({ projectId, activeCompPath, onClose }: AgentChat
     setAttachedSnippet(undefined);
   };
 
+  const handleVideoFile = async (file: File) => {
+    setVideoUpload({ state: "uploading", filename: file.name });
+    try {
+      // Sanitize filename: strip path separators and any `..` segments the
+      // upload route silently drops (files.ts:418-419). If we don't do this
+      // here the user sees "no path returned" with no useful explanation.
+      const safeName = file.name
+        .split(/[\\/]/)
+        .pop()!
+        .replace(/\.{2,}/g, ".");
+      const formData = new FormData();
+      formData.append("file", file, safeName);
+      const res = await fetch(`/api/projects/${projectId}/upload?dir=assets`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const message = res.status === 413 ? "Video too large" : `Upload failed (${res.status})`;
+        setVideoUpload({ state: "error", message });
+        return;
+      }
+      const data = (await res.json()) as {
+        files?: string[];
+        invalid?: { name: string; reason?: string }[];
+        skipped?: string[];
+      };
+      if (data.invalid && data.invalid.length > 0) {
+        const first = data.invalid[0];
+        const reason = first.reason ? `: ${first.reason}` : "";
+        setVideoUpload({ state: "error", message: `Rejected ${first.name}${reason}` });
+        return;
+      }
+      if (data.skipped && data.skipped.length > 0) {
+        setVideoUpload({ state: "error", message: `Skipped: ${data.skipped[0]}` });
+        return;
+      }
+      const uploadedPath =
+        Array.isArray(data.files) && data.files.length > 0 ? data.files[0] : null;
+      if (!uploadedPath) {
+        // Last-resort diagnostic — the upload route drops some filenames
+        // without reporting them. Surface the full response in the console
+        // so the user can capture it for debugging.
+        console.error("Upload returned no path", {
+          request: { name: file.name, safeName },
+          response: data,
+        });
+        setVideoUpload({
+          state: "error",
+          message:
+            "Upload succeeded but no file was written. Check the browser console; the filename may contain unsupported characters.",
+        });
+        return;
+      }
+      setVideoUpload(null);
+      const prompt = `Generate a reusable skill from this reference video: ${uploadedPath}. Capture the visual style, palette, typography, and animation patterns; synthesize a SKILL.md and save it as a user-scoped skill so I can reuse it across projects.`;
+      setInput((prev) => (prev.trim().length === 0 ? prompt : `${prev}\n\n${prompt}`));
+    } catch {
+      setVideoUpload({ state: "error", message: "Upload failed: network error" });
+    }
+  };
+
+  const isVideoDrag = (event: ReactDragEvent<HTMLElement>): boolean => {
+    const types = event.dataTransfer?.types;
+    if (!types) return false;
+    // DataTransfer.types includes "Files" for file drags. We can't read the
+    // MIME yet during dragover (Chrome hides it for security), so we accept
+    // any file drag here and re-validate on drop.
+    return Array.from(types).includes("Files");
+  };
+
+  const handleDragEnter = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isVideoDrag(event)) return;
+    event.preventDefault();
+    dragCounterRef.current += 1;
+    if (dragCounterRef.current === 1) setDragActive(true);
+  };
+
+  const handleDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isVideoDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isVideoDrag(event)) return;
+    event.preventDefault();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) setDragActive(false);
+  };
+
+  const handleDrop = async (event: ReactDragEvent<HTMLElement>) => {
+    if (!isVideoDrag(event)) return;
+    event.preventDefault();
+    dragCounterRef.current = 0;
+    setDragActive(false);
+    const file = event.dataTransfer.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("video/")) {
+      setVideoUpload({ state: "error", message: `Not a video file: ${file.name}` });
+      return;
+    }
+    await handleVideoFile(file);
+  };
+
   const handleSubmit = async () => {
     const text = input.trim();
     if (!text) return;
@@ -157,7 +268,23 @@ export function AgentChatPanel({ projectId, activeCompPath, onClose }: AgentChat
       (lastBlock.type === "thinking" && !lastBlock.streaming));
 
   return (
-    <aside className="flex flex-col h-full w-[380px] bg-neutral-950 border-l border-neutral-800 flex-shrink-0">
+    <aside
+      className="relative flex flex-col h-full w-[380px] bg-neutral-950 border-l border-neutral-800 flex-shrink-0"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dragActive && (
+        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-studio-accent/10 border-2 border-dashed border-studio-accent/60 backdrop-blur-[1px]">
+          <div className="px-4 py-2.5 rounded-md bg-neutral-950/90 border border-studio-accent/50 text-[11px] text-studio-accent font-medium text-center">
+            Drop a video to generate a skill from it
+            <div className="text-[10px] text-neutral-400 font-normal mt-0.5">
+              MP4, WebM, MOV · uploads to assets/
+            </div>
+          </div>
+        </div>
+      )}
       <header className="h-10 px-3 flex items-center justify-between border-b border-neutral-800 flex-shrink-0">
         <div className="flex items-center gap-2">
           <SparkleIcon />
@@ -235,6 +362,13 @@ export function AgentChatPanel({ projectId, activeCompPath, onClose }: AgentChat
               />
             ) : pickerActive ? (
               <PickerHintChip onCancel={() => setPickerActive(false)} />
+            ) : videoUpload?.state === "uploading" ? (
+              <VideoUploadingChip filename={videoUpload.filename} />
+            ) : videoUpload?.state === "error" ? (
+              <VideoUploadErrorChip
+                message={videoUpload.message}
+                onDismiss={() => setVideoUpload(null)}
+              />
             ) : null
           }
           leadingActions={
@@ -440,6 +574,36 @@ function AttachedElementChip({ label, onClear }: { label: string; onClear: () =>
         title="Remove attachment"
         aria-label="Remove attached element"
         className="text-studio-accent/70 hover:text-studio-accent"
+      >
+        <CloseIcon />
+      </button>
+    </div>
+  );
+}
+
+function VideoUploadingChip({ filename }: { filename: string }) {
+  return (
+    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-studio-accent/10 border border-studio-accent/30 text-[11px] text-studio-accent self-start max-w-full">
+      <span className="inline-block h-2.5 w-2.5 rounded-full border-2 border-studio-accent border-t-transparent animate-spin" />
+      <span className="truncate flex-1 min-w-0" title={filename}>
+        Uploading {filename}…
+      </span>
+    </div>
+  );
+}
+
+function VideoUploadErrorChip({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  return (
+    <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-950/30 border border-red-900/50 text-[11px] text-red-300 self-start max-w-full">
+      <span className="truncate flex-1 min-w-0" title={message}>
+        {message}
+      </span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        title="Dismiss"
+        aria-label="Dismiss upload error"
+        className="text-red-400/70 hover:text-red-300"
       >
         <CloseIcon />
       </button>

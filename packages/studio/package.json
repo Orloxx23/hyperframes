@@ -39,7 +39,9 @@
     "@hyperframes/core": "workspace:*",
     "@hyperframes/player": "workspace:*",
     "@phosphor-icons/react": "^2.1.10",
-    "mediabunny": "^1.45.3"
+    "mediabunny": "^1.45.3",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@hyperframes/producer": "workspace:*",

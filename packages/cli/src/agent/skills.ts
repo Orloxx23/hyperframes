@@ -317,15 +317,12 @@ export interface CreateProjectSkillInput {
 export interface CreateProjectSkillResult {
   path: string;
   dirName: string;
+  scope: SkillScope;
 }
 
-/**
- * Write a new skill into `<projectDir>/.claude/skills/<slug>/SKILL.md`. The
- * caller is expected to validate inputs (we still enforce the bare minimum:
- * non-empty name + description, slug uniqueness within the project).
- */
-export function createProjectSkill(
-  projectDir: string,
+function createSkillInRoot(
+  root: string,
+  scope: SkillScope,
   input: CreateProjectSkillInput,
 ): CreateProjectSkillResult {
   const name = input.name.trim();
@@ -335,10 +332,11 @@ export function createProjectSkill(
   const slug = slugify(name);
   if (!slug) throw new Error("Skill name must contain at least one alphanumeric character.");
 
-  const root = projectSkillsRoot(projectDir);
   const dir = join(root, slug);
   if (existsSync(dir)) {
-    throw new Error(`A project skill named "${slug}" already exists.`);
+    throw new Error(
+      `A ${scope} skill named "${slug}" already exists. Pick a different name or add a discriminator (e.g. "${slug}-v2").`,
+    );
   }
   mkdirSync(dir, { recursive: true });
 
@@ -357,7 +355,28 @@ export function createProjectSkill(
   );
   const skillPath = join(dir, "SKILL.md");
   writeFileSync(skillPath, md, "utf-8");
-  return { path: skillPath, dirName: slug };
+  return { path: skillPath, dirName: slug, scope };
+}
+
+/**
+ * Write a new skill into `<projectDir>/.claude/skills/<slug>/SKILL.md`. The
+ * caller is expected to validate inputs (we still enforce the bare minimum:
+ * non-empty name + description, slug uniqueness within the project).
+ */
+export function createProjectSkill(
+  projectDir: string,
+  input: CreateProjectSkillInput,
+): CreateProjectSkillResult {
+  return createSkillInRoot(projectSkillsRoot(projectDir), "project", input);
+}
+
+/**
+ * Write a new skill into `~/.claude/skills/<slug>/SKILL.md`. Used by the
+ * `create_skill` MCP tool when the agent generates a reusable skill (e.g.
+ * from a reference video). User skills are visible across every project.
+ */
+export function createUserSkill(input: CreateProjectSkillInput): CreateProjectSkillResult {
+  return createSkillInRoot(userSkillsRoot(), "user", input);
 }
 
 // ── Curated catalog + install ──────────────────────────────────────────────

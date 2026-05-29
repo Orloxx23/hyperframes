@@ -1,13 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, unlinkSync } from "node:fs";
+import { get as httpsGet } from "node:https";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { downloadFile } from "../utils/download.js";
 
 const MODELS_DIR = join(homedir(), ".cache", "hyperframes", "whisper", "models");
+const PREBUILT_DIR = join(homedir(), ".cache", "hyperframes", "whisper", "prebuilt");
 const DEFAULT_MODEL = "small.en";
 
-export type WhisperSource = "env" | "system" | "brew" | "build";
+export type WhisperSource = "env" | "system" | "brew" | "build" | "prebuilt";
 
 export interface WhisperResult {
   executablePath: string;
@@ -60,6 +62,180 @@ function findFromSystem(): WhisperResult | undefined {
   }
 
   return undefined;
+}
+
+// --- Pre-built binary (Windows) ---------------------------------------------
+
+const WHISPER_EXE = process.platform === "win32" ? "whisper-cli.exe" : "whisper-cli";
+
+function findBinaryRecursive(dir: string, filename: string): string | undefined {
+  if (!existsSync(dir)) return undefined;
+  const stack: string[] = [dir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (!cur) continue;
+    let entries: import("node:fs").Dirent[] = [];
+    try {
+      entries = readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.name === filename) return p;
+    }
+  }
+  return undefined;
+}
+
+function findFromPrebuilt(): WhisperResult | undefined {
+  const p = findBinaryRecursive(PREBUILT_DIR, WHISPER_EXE);
+  return p ? { executablePath: p, source: "prebuilt" } : undefined;
+}
+
+interface GhAsset {
+  name: string;
+  browser_download_url: string;
+  size?: number;
+}
+
+interface GhRelease {
+  tag_name: string;
+  assets: GhAsset[];
+}
+
+/**
+ * Follow redirects and fetch JSON. Used for the GitHub releases API which
+ * sometimes redirects authenticated requests. Sets a UA header because
+ * GitHub rejects requests without one.
+ */
+function fetchJson<T>(url: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const follow = (u: string, depth: number) => {
+      if (depth > 5) {
+        reject(new Error(`too many redirects fetching ${url}`));
+        return;
+      }
+      const parsed = new URL(u);
+      httpsGet(
+        {
+          hostname: parsed.hostname,
+          path: `${parsed.pathname}${parsed.search}`,
+          headers: {
+            "User-Agent": "hyperframes-cli",
+            Accept: "application/vnd.github+json",
+          },
+        },
+        (res) => {
+          if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
+            const location = res.headers.location;
+            if (location) {
+              follow(location, depth + 1);
+              return;
+            }
+          }
+          if (res.statusCode !== 200) {
+            reject(new Error(`GitHub API returned HTTP ${res.statusCode} for ${u}`));
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")) as T);
+            } catch (e) {
+              reject(
+                new Error(
+                  `failed to parse GitHub API response: ${e instanceof Error ? e.message : e}`,
+                ),
+              );
+            }
+          });
+        },
+      ).on("error", (err) => reject(err));
+    };
+    follow(url, 0);
+  });
+}
+
+/**
+ * Pick the best Windows pre-built asset from a whisper.cpp release. We
+ * prefer the plain CPU build (`whisper-bin-x64.zip`) over BLAS / CUDA
+ * variants — those depend on additional runtimes the user may not have.
+ */
+function pickWindowsAsset(release: GhRelease): GhAsset | undefined {
+  const patterns = [
+    /^whisper-bin-x64\.zip$/i,
+    /^whisper-blas-bin-x64\.zip$/i,
+    /^whisper-bin-Win32\.zip$/i,
+  ];
+  for (const re of patterns) {
+    const match = release.assets.find((a) => re.test(a.name));
+    if (match) return match;
+  }
+  return undefined;
+}
+
+/**
+ * Download and extract the official whisper.cpp pre-built Windows binary.
+ * Avoids the need for git + cmake + a C++ compiler. The release is fetched
+ * from GitHub's API so we always grab the latest published binary.
+ */
+async function downloadPrebuiltWindows(onProgress?: (msg: string) => void): Promise<WhisperResult> {
+  onProgress?.("Fetching latest whisper.cpp release...");
+  const release = await fetchJson<GhRelease>(
+    "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest",
+  );
+  const asset = pickWindowsAsset(release);
+  if (!asset) {
+    throw new Error(
+      `no compatible Windows pre-built found in release ${release.tag_name}. ` +
+        `Set HYPERFRAMES_WHISPER_PATH to a manually-installed whisper-cli.exe.`,
+    );
+  }
+
+  mkdirSync(PREBUILT_DIR, { recursive: true });
+  const zipPath = join(PREBUILT_DIR, asset.name);
+  onProgress?.(`Downloading ${asset.name} (${release.tag_name})...`);
+  await downloadFile(asset.browser_download_url, zipPath);
+
+  onProgress?.("Extracting...");
+  try {
+    // PowerShell's Expand-Archive ships with every supported Windows version
+    // — no need for the user to have 7-Zip or another tool installed.
+    execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' -DestinationPath '${PREBUILT_DIR.replace(/'/g, "''")}' -Force`,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 },
+    );
+  } catch (err) {
+    let detail = "";
+    if (err && typeof err === "object" && "stderr" in err) {
+      const stderr = String(err.stderr).trim();
+      if (stderr) detail = `\n${stderr.slice(-500)}`;
+    }
+    throw new Error(`failed to extract ${asset.name}${detail}`);
+  } finally {
+    try {
+      unlinkSync(zipPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+
+  const result = findFromPrebuilt();
+  if (!result) {
+    throw new Error(
+      `extracted ${asset.name} but ${WHISPER_EXE} was not found inside. The release format may have changed.`,
+    );
+  }
+  return result;
 }
 
 // --- Build from source ------------------------------------------------------
@@ -128,12 +304,20 @@ function buildFromSource(onProgress?: (msg: string) => void): WhisperResult {
 // --- Public API -------------------------------------------------------------
 
 export function findWhisper(): WhisperResult | undefined {
-  return findFromEnv() ?? findFromSystem() ?? findBuiltBinary();
+  return findFromEnv() ?? findFromSystem() ?? findFromPrebuilt() ?? findBuiltBinary();
 }
 
 function getInstallInstructions(): string {
   if (platform() === "darwin") {
     return "brew install whisper-cpp";
+  }
+  if (platform() === "win32") {
+    return (
+      "Hyperframes auto-downloads whisper.cpp's pre-built Windows binary on first " +
+      "use — if that failed, manually download the latest `whisper-bin-x64.zip` " +
+      "from https://github.com/ggml-org/whisper.cpp/releases, extract it, and " +
+      "set HYPERFRAMES_WHISPER_PATH to the whisper-cli.exe inside."
+    );
   }
   return "See https://github.com/ggml-org/whisper.cpp#building";
 }
@@ -157,7 +341,25 @@ export async function ensureWhisper(options?: {
   const existing = findWhisper();
   if (existing) return existing;
 
-  // 2. Try brew (macOS, fastest — pre-built bottle)
+  // Track the diagnostic reasons each install path failed so the final error
+  // can tell the user what actually went wrong (the old code swallowed every
+  // failure and surfaced a generic "not found" message).
+  const failures: string[] = [];
+
+  // 2a. Windows: download official pre-built binary. Avoids the
+  // git + cmake + MSVC chain entirely. This is almost always what a
+  // Windows user wants — much faster and more reliable than building.
+  if (platform() === "win32") {
+    try {
+      return await downloadPrebuiltWindows(options?.onProgress);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failures.push(`pre-built download: ${msg}`);
+      options?.onProgress?.(`Pre-built download failed (${msg}). Trying source build...`);
+    }
+  }
+
+  // 2b. macOS: try brew (fastest — pre-built bottle)
   if (platform() === "darwin" && hasBrew()) {
     options?.onProgress?.("Installing whisper-cpp via Homebrew...");
     try {
@@ -167,22 +369,27 @@ export async function ensureWhisper(options?: {
       });
       const installed = findFromSystem();
       if (installed) return { ...installed, source: "brew" };
-    } catch {
-      // brew failed — fall through
+      failures.push("brew install succeeded but whisper-cli not on PATH after");
+    } catch (err) {
+      failures.push(`brew install: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   // 3. Build from source (needs git + cmake + C compiler)
-  if (hasGit() && hasCmake()) {
+  if (!hasGit()) failures.push("git is not installed");
+  else if (!hasCmake()) failures.push("cmake is not installed");
+  else {
     try {
       return buildFromSource(options?.onProgress);
-    } catch {
-      // build failed — fall through
+    } catch (err) {
+      failures.push(`source build: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   // 4. Give up — tell the user how
-  throw new Error(`whisper-cpp not found. Install: ${getInstallInstructions()}`);
+  throw new Error(
+    `whisper-cpp not found and all install paths failed:\n  - ${failures.join("\n  - ")}\n\n${getInstallInstructions()}`,
+  );
 }
 
 export async function ensureModel(

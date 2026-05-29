@@ -1,8 +1,8 @@
 import { execSync } from "node:child_process";
 
-export function findFFmpeg(): string | undefined {
+function which(binary: string): string | undefined {
   try {
-    const cmd = process.platform === "win32" ? "where ffmpeg" : "which ffmpeg";
+    const cmd = process.platform === "win32" ? `where ${binary}` : `which ${binary}`;
     const output = execSync(cmd, {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
@@ -16,6 +16,14 @@ export function findFFmpeg(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+export function findFFmpeg(): string | undefined {
+  return which("ffmpeg");
+}
+
+export function findFFprobe(): string | undefined {
+  return which("ffprobe");
 }
 
 export function getFFmpegInstallHint(): string {
